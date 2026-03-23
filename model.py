@@ -219,8 +219,10 @@ class MARASSModel(nn.Module):
         bgc_aux    = batch["bgc_aux"]       # (B, T, 5, H, W)  o2,no3,po4,si,nppv
 
         B, T, H, W = chl_obs.shape
-        assert T == cfg.T, f"Expected T={cfg.T}, got {T}"
-        assert H == cfg.H and W == cfg.W, f"Expected ({cfg.H},{cfg.W}), got ({H},{W})"
+        if T != cfg.T:
+            raise RuntimeError(f"Expected T={cfg.T}, got {T}")
+        if H != cfg.H or W != cfg.W:
+            raise RuntimeError(f"Expected ({cfg.H},{cfg.W}), got ({H},{W})")
 
         # ------------------------------------------------------------------
         # 1. Prepare multi-stream inputs
@@ -228,18 +230,21 @@ class MARASSModel(nn.Module):
         optical = torch.stack([chl_obs, obs_mask], dim=2)                           # (B, T, 2, H, W)
         masks   = torch.stack([obs_mask, mcar_mask, mnar_mask, bloom_mask], dim=2)  # (B, T, 4, H, W)
 
-        # During training, randomly hold out a fraction of observed pixels in the
-        # last timestep of the optical stream. This forces the model to reconstruct
-        # those pixels from surrounding context + physics rather than copying input,
-        # generating direct gradient signal on gap-filling quality.
+        # During training, randomly hold out a fraction of observed pixels across
+        # the optical sequence. This removes easy temporal shortcuts and forces
+        # the model to reconstruct the last step from degraded history + physics.
+        # The exposed holdout mask still tracks only the last step because the
+        # reconstruction heads are supervised on the current timestep only.
         holdout_mask = None
         if self.training and cfg.holdout_frac > 0:
-            obs_last = obs_mask[:, -1]                              # (B, H, W)
-            rand     = torch.rand_like(obs_last)
-            holdout_mask = ((obs_last > 0.5) & (rand < cfg.holdout_frac)).float()  # (B, H, W)
+            seq_holdout_mask = (
+                (obs_mask > 0.5) & (torch.rand_like(obs_mask) < cfg.holdout_frac)
+            ).float()                                              # (B, T, H, W)
             optical = optical.clone()
-            optical[:, -1, 0] = optical[:, -1, 0] * (1.0 - holdout_mask)  # zero chl_obs
-            optical[:, -1, 1] = optical[:, -1, 1] * (1.0 - holdout_mask)  # zero obs_mask
+            keep_mask = 1.0 - seq_holdout_mask
+            optical[:, :, 0] = optical[:, :, 0] * keep_mask        # zero chl_obs
+            optical[:, :, 1] = optical[:, :, 1] * keep_mask        # zero obs_mask
+            holdout_mask = seq_holdout_mask[:, -1]                 # (B, H, W)
 
         # ------------------------------------------------------------------
         # 2. Encode (five independent streams)
