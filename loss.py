@@ -113,6 +113,41 @@ def recon_loss(
     return (nll * sup_mask).sum() / n_valid
 
 
+
+
+# ======================================================================
+# Holdout reconstruction loss — gap-filling supervision
+# ======================================================================
+
+def holdout_recon_loss(
+    pred:         Tensor,
+    target:       Tensor,
+    holdout_mask: Tensor,
+    land_mask:    Tensor,
+) -> Tensor:
+    """
+    MSE loss on pixels that were artificially held out during the forward pass.
+
+    These pixels were observed (ground truth available) but zeroed in the
+    optical input so the model had to infer them from context. Supervising
+    on them directly trains the gap-filling pathway.
+
+    Args:
+        pred:         (B, 1, H, W)  reconstruction output
+        target:       (B, H, W)     chl_obs last timestep (ground truth)
+        holdout_mask: (B, H, W)     1 = pixel was held out this forward pass
+        land_mask:    (B, H, W)     1 = land
+
+    Returns:
+        Scalar loss.
+    """
+    ocean    = 1.0 - land_mask                             # (B, H, W)
+    sup_mask = holdout_mask * ocean                        # only ocean hold-outs
+    n_valid  = sup_mask.sum().clamp(min=1.0)
+    pred_sq  = pred.squeeze(1)                             # (B, H, W)
+    mse      = (pred_sq - target).pow(2)
+    return (mse * sup_mask).sum() / n_valid
+
 # ======================================================================
 # Forecast loss — masked MSE
 # ======================================================================
@@ -200,11 +235,19 @@ def eri_loss(
     target_long = target.long().clamp(0, n_levels - 1)
     nll = F.nll_loss(log_probs, target_long, reduction="none")  # (B, H, W)
 
+    # Per-class inverse-frequency weights to counter level-0 dominance.
+    # Approximate priors for Bay of Bengal bloom statistics:
+    # level 0 (~95%), level 1 (~2%), level 2 (~1%), level 3 (~1%), level 4 (~1%)
+    class_weights = torch.tensor(
+        [0.20, 2.0, 3.0, 4.0, 5.0], device=logits.device
+    )
+    sample_weight = class_weights[target_long]             # (B, H, W)
+
     # Ordinal penalty weight: 1 + |predicted_level - true_level|
     pred_level  = logits.argmax(dim=1).float()             # (B, H, W)
     ord_penalty = 1.0 + (pred_level - target.float()).abs()
 
-    pixel_loss = nll * ord_penalty                         # (B, H, W)
+    pixel_loss = nll * ord_penalty * sample_weight         # (B, H, W)
 
     # Bloom upweighting — bloom events are rare so they'd be overwhelmed
     # by the majority "no risk" class without this
@@ -212,7 +255,7 @@ def eri_loss(
     if bloom_mask is not None:
         # Any timestep with bloom activity → upweight that pixel
         bloom_any = (bloom_mask.sum(dim=1) > 0).float()   # (B, H, W)
-        weight = weight * (1.0 + 3.0 * bloom_any)         # 4× weight on bloom pixels
+        weight = weight * (1.0 + 9.0 * bloom_any)         # 10× weight on bloom pixels
 
     n_valid = weight.sum().clamp(min=1.0)
     return (pixel_loss * weight).sum() / n_valid
@@ -259,7 +302,8 @@ class LossWeights:
     recon:    float = 1.0
     forecast: float = 0.5
     eri:      float = 0.3
-    aux:      float = 0.01
+    aux:      float = 0.001   # reduced from 0.01 — allows expert specialisation
+    holdout:  float = 0.5     # gap-filling supervision on held-out observed pixels
 
 
 class MARASSLoss(nn.Module):
@@ -369,6 +413,17 @@ class MARASSLoss(nn.Module):
         else:
             l_aux = torch.tensor(0.0, device=l_recon.device)
 
+        # --- Holdout reconstruction loss (gap-filling supervision) ---
+        if "holdout_mask" in outputs and outputs["holdout_mask"] is not None:
+            l_holdout = holdout_recon_loss(
+                pred         = outputs["recon"],
+                target       = chl_obs[:, -1],
+                holdout_mask = outputs["holdout_mask"],
+                land_mask    = land_mask,
+            )
+        else:
+            l_holdout = torch.tensor(0.0, device=l_recon.device)
+
         # --- Curriculum scaling for secondary tasks ---
         scale = self._curriculum_scale(step, total_steps)
 
@@ -377,6 +432,7 @@ class MARASSLoss(nn.Module):
           + self.w.forecast * scale * l_forecast
           + self.w.eri      * scale * l_eri
           + self.w.aux      * l_aux
+          + self.w.holdout  * l_holdout
         )
 
         breakdown = {
@@ -385,6 +441,7 @@ class MARASSLoss(nn.Module):
             "forecast": l_forecast.item(),
             "eri":      l_eri.item(),
             "aux":      l_aux.item(),
+            "holdout":  l_holdout.item(),
             "curriculum_scale": scale,
         }
 
