@@ -259,7 +259,7 @@ class UncertaintyAccumulator:
         obs_mask:  torch.Tensor,   # (B, H, W)
         land_mask: torch.Tensor,   # (B, H, W)
     ) -> None:
-        ocean = (1.0 - land_mask.float()).cpu()
+        ocean = (1.0 - land_mask.float())  # keep on device
         valid = (obs_mask.float() * ocean).bool().cpu()
 
         lv_sq  = log_var.squeeze(1).float().cpu()
