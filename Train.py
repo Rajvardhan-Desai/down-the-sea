@@ -253,6 +253,10 @@ def run_epoch(
         for batch in loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
+            # zero_grad before forward so step ordering is unambiguous
+            if is_train:
+                optimizer.zero_grad(set_to_none=True)
+
             with autocast(device_type=amp_device, enabled=amp_enabled):
                 outputs = model(batch)
                 loss, breakdown = criterion(
@@ -262,8 +266,6 @@ def run_epoch(
                 )
 
             if is_train:
-                optimizer.zero_grad(set_to_none=True)
-
                 if amp_enabled and scaler is not None:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -466,7 +468,7 @@ def main() -> None:
     model = MARASSModel(cfg).to(device)
 
     if using_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     if is_main:
         log.info(f"Parameters: {sum(p.numel() for p in unwrap_model(model).parameters()):,}")
