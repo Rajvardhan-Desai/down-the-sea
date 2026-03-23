@@ -348,7 +348,7 @@ class SwinBlock(nn.Module):
 
 
 def make_stage(dim: int, num_heads: int, window_size: int,
-               depth: int, drop: float = 0.0) -> nn.Sequential:
+               depth: int, drop: float = 0.1) -> nn.Sequential:
     """Build a sequence of Swin blocks, alternating W-MSA and SW-MSA."""
     return nn.Sequential(*[
         SwinBlock(dim, num_heads, window_size, block_idx=i, drop=drop)
@@ -392,7 +392,7 @@ class OpticalEncoder(nn.Module):
         depths: tuple[int, ...] = (2, 2, 2),
         num_heads: tuple[int, ...] = (4, 8, 16),
         window_sizes: tuple[int, ...] = (8, 8, 4),
-        drop_rate: float = 0.0,
+        drop_rate: float = 0.1,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim

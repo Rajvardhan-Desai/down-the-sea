@@ -151,6 +151,7 @@ class PerceiverFusionBlock(nn.Module):
         W: int = 64,
         kv_pool_size: int = 16,
         n_streams: int = 5,
+        drop_rate: float = 0.1,
     ) -> None:
         super().__init__()
         self.embed_dim    = embed_dim
@@ -171,13 +172,15 @@ class PerceiverFusionBlock(nn.Module):
             query_dim=embed_dim,
             kv_dim=embed_dim,
             num_heads=num_heads,
+            attn_drop=drop_rate,
+            proj_drop=drop_rate,
         )
         self.cross_norm_q  = nn.LayerNorm(embed_dim)
         self.cross_norm_kv = nn.LayerNorm(embed_dim)
 
         # Self-attention on latents: refine cross-modal representation
         self.self_attn = nn.MultiheadAttention(
-            embed_dim, num_heads=num_heads, batch_first=True
+            embed_dim, num_heads=num_heads, dropout=drop_rate, batch_first=True
         )
         self.self_norm  = nn.LayerNorm(embed_dim)
 
@@ -186,11 +189,24 @@ class PerceiverFusionBlock(nn.Module):
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
+            nn.Dropout(drop_rate),
             nn.Linear(embed_dim * 4, embed_dim),
+            nn.Dropout(drop_rate),
         )
 
-        # Decode: project n_latents → H*W spatial tokens
-        self.decode = nn.Linear(n_latents, H * W, bias=False)
+        # Decode with explicit spatial queries so each output location carries
+        # its own positional signal before attending back to the latent set.
+        self.row_embed = nn.Parameter(torch.randn(H, embed_dim) * 0.02)
+        self.col_embed = nn.Parameter(torch.randn(W, embed_dim) * 0.02)
+        self.decode_attn = CrossAttention(
+            query_dim=embed_dim,
+            kv_dim=embed_dim,
+            num_heads=num_heads,
+            attn_drop=drop_rate,
+            proj_drop=drop_rate,
+        )
+        self.decode_norm_q = nn.LayerNorm(embed_dim)
+        self.decode_norm_kv = nn.LayerNorm(embed_dim)
         self.decode_norm = nn.LayerNorm(embed_dim)
 
     def forward(
@@ -245,10 +261,17 @@ class PerceiverFusionBlock(nn.Module):
         # MLP
         latents = latents + self.mlp(latents)              # (N, n_latents, D)
 
-        # Decode latents → full-resolution spatial tokens
-        spatial = self.decode(latents.transpose(1, 2))     # (N, D, H*W)
-        spatial = self.decode_norm(spatial.transpose(1, 2)).transpose(1, 2)
-        spatial = spatial.view(N, D, H, W)                 # (N, D, H, W)
+        # Decode latents → full-resolution spatial tokens via learned
+        # position-aware spatial queries instead of a flat transpose projection.
+        spatial_queries = (
+            self.row_embed[:, None, :] + self.col_embed[None, :, :]
+        ).view(1, H * W, D).expand(N, -1, -1)
+        spatial = spatial_queries + self.decode_attn(
+            self.decode_norm_q(spatial_queries),
+            self.decode_norm_kv(latents),
+        )                                                  # (N, H*W, D)
+        spatial = self.decode_norm(spatial)
+        spatial = spatial.transpose(1, 2).view(N, D, H, W)
 
         return spatial
 
@@ -336,6 +359,7 @@ class FusionModule(nn.Module):
         num_heads: int = 8,
         H: int = 64,
         W: int = 64,
+        drop_rate: float = 0.1,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -347,6 +371,7 @@ class FusionModule(nn.Module):
             H=H,
             W=W,
             n_streams=5,
+            drop_rate=drop_rate,
         )
 
         # Residual blend: fused output + mean of all five inputs
@@ -428,7 +453,7 @@ def run_smoke_test() -> None:
     opt_flat = opt_feat.view(B * T, D, H, W)
     phy_flat = phy_feat.view(B * T, D, H, W)
     loss = compute_contrastive_loss(opt_flat, phy_flat)
-    print(f"Contrastive loss (sanity): {loss.item():.4f}  (expect ~log(B*T) ≈ {math.log(B*T):.2f} at init)")
+    print(f"Contrastive loss (sanity): {loss.item():.4f}  (expect ~log(B*T) ~= {math.log(B*T):.2f} at init)")
 
     if tuple(out.shape) == expected and nan_count == 0:
         print("\nSmoke test passed.")
