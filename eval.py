@@ -155,7 +155,7 @@ class ForecastAccumulator:
         target_mask: torch.Tensor,   # (B, H_fcast, H, W)
         land_mask:   torch.Tensor,   # (B, H, W)
     ) -> None:
-        ocean = (1.0 - land_mask.float()).unsqueeze(1).cpu()  # (B, 1, H, W)
+        ocean = (1.0 - land_mask.float()).unsqueeze(1)  # (B, 1, H, W) — keep on device
         valid = (target_mask.float() * ocean).bool().cpu()
 
         pred_c   = pred.float().cpu()
