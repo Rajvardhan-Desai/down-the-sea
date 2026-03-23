@@ -145,9 +145,8 @@ def compute_aux_loss(routing_weights: Tensor) -> Tensor:
 
     # Hard assignment: which expert has the highest weight per sample
     top1 = routing_weights.argmax(dim=-1)                    # (B,)
-    f = torch.zeros(n_experts, device=routing_weights.device)
-    for e in range(n_experts):
-        f[e] = (top1 == e).float().mean()                   # fraction of batch → expert e
+    f = torch.bincount(top1, minlength=n_experts).to(routing_weights.dtype)
+    f = f / top1.numel()                                     # fraction of batch → expert e
 
     # Mean routing weight per expert
     p = routing_weights.mean(dim=0)                         # (n_experts,)
