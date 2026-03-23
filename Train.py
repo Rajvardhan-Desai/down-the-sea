@@ -40,6 +40,7 @@ DDP note:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import math
 import os
@@ -53,7 +54,7 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
@@ -91,20 +92,39 @@ def ddp_cleanup() -> None:
         dist.destroy_process_group()
 
 
-def reduce_dict(d: dict[str, float], world_size: int) -> dict[str, float]:
-    """Average a dict of scalar metrics across all DDP ranks."""
+def reduce_sum_tensor(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
+    """Sum-reduce a tensor across DDP ranks."""
     if world_size == 1:
-        return d
-    keys   = sorted(d.keys())
-    tensor = torch.tensor([d[k] for k in keys], dtype=torch.float64, device="cuda")
+        return tensor
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    tensor /= world_size
-    return {k: tensor[i].item() for i, k in enumerate(keys)}
+    return tensor
+
+
+def reduce_max_tensor(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
+    """Max-reduce a tensor across DDP ranks."""
+    if world_size == 1:
+        return tensor
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return tensor
 
 
 def unwrap_model(model: nn.Module) -> MARASSModel:
     """Strip DDP wrapper to access the underlying MARASSModel."""
     return model.module if isinstance(model, DDP) else model
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Shard eval datasets across ranks without padding or duplicated samples."""
+
+    def __init__(self, dataset: MARASSDataset, rank: int, world_size: int) -> None:
+        self.start = (len(dataset) * rank) // world_size
+        self.end = (len(dataset) * (rank + 1)) // world_size
+
+    def __iter__(self):
+        return iter(range(self.start, self.end))
+
+    def __len__(self) -> int:
+        return self.end - self.start
 
 
 # ======================================================================
@@ -119,23 +139,26 @@ def _build_ddp_loaders(
     world_size: int,
 ) -> dict[str, DataLoader]:
     """
-    Build train/val/test loaders with DistributedSampler for DDP.
+    Build train/val/test loaders with distributed sharding for DDP.
 
     Train loader uses a DistributedSampler (shuffle handled per-epoch via
-    sampler.set_epoch). Val/test loaders also use DistributedSampler so
+    sampler.set_epoch). Val/test loaders use a non-padding sampler so
     every rank evaluates a non-overlapping shard — metrics are then averaged
-    across ranks in reduce_dict().
+    across ranks with weighted metric reduction.
     """
     loaders = {}
     for split in ("train", "val", "test"):
         dataset = MARASSDataset(patch_dir=patch_dir, split=split)
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=(split == "train"),
-            drop_last=(split == "train"),
-        )
+        if split == "train":
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                drop_last=True,
+            )
+        else:
+            sampler = DistributedEvalSampler(dataset, rank=rank, world_size=world_size)
         loaders[split] = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -205,16 +228,54 @@ def build_scheduler(optimizer: AdamW, warmup_steps: int, total_steps: int) -> La
 # Metrics helpers
 # ======================================================================
 
-def masked_rmse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
+def routing_entropy(routing_weights: torch.Tensor) -> float:
+    mean_w = routing_weights if routing_weights.ndim == 1 else routing_weights.mean(dim=0)
+    return -(mean_w * (mean_w + 1e-8).log()).sum().item()
+
+
+def stable_holdout_mask(
+    obs_mask: torch.Tensor,
+    land_mask: torch.Tensor,
+    holdout_frac: float,
+) -> torch.Tensor:
+    """Build a deterministic validation holdout mask from observed ocean pixels."""
+    if holdout_frac <= 0:
+        return torch.zeros_like(obs_mask)
+
+    obs_cpu = obs_mask.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    digest = hashlib.sha1(obs_cpu.numpy().tobytes()).digest()
+    seed = int.from_bytes(digest[:8], byteorder="little", signed=False)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    rand = torch.rand(obs_mask.shape, generator=generator).to(obs_mask.device)
+    ocean = 1.0 - land_mask
+    return ((obs_mask > 0.5) & (ocean > 0.5) & (rand < holdout_frac)).float()
+
+
+def compute_masked_rmse_stats(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[float, float]:
+    """Return (sum_squared_error, count) over a binary mask."""
     valid = mask.bool()
     if not valid.any():
-        return float("nan")
-    return (pred[valid] - target[valid]).pow(2).mean().sqrt().item()
+        return 0.0, 0.0
+    diff = pred[valid].float() - target[valid].float()
+    return diff.pow(2).sum().item(), float(valid.sum().item())
 
 
-def routing_entropy(routing_weights: torch.Tensor) -> float:
-    mean_w = routing_weights.mean(dim=0)
-    return -(mean_w * (mean_w + 1e-8).log()).sum().item()
+def build_gap_eval_batch(
+    batch: dict[str, torch.Tensor],
+    holdout_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Zero held-out last-step inputs for synthetic validation gap evaluation."""
+    eval_batch = dict(batch)
+    eval_batch["chl_obs"] = batch["chl_obs"].clone()
+    eval_batch["obs_mask"] = batch["obs_mask"].clone()
+    eval_batch["chl_obs"][:, -1] *= (1.0 - holdout_mask)
+    eval_batch["obs_mask"][:, -1] *= (1.0 - holdout_mask)
+    return eval_batch
 
 
 # ======================================================================
@@ -238,14 +299,20 @@ def run_epoch(
     world_size: int = 1,
     is_main: bool = True,
 ) -> tuple[dict[str, float], int]:
-    is_train    = (phase == "train")
-    amp_device  = "cuda" if device.type == "cuda" else "cpu"
+    is_train = (phase == "train")
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
     amp_enabled = use_amp and (device.type == "cuda")
 
     model.train(is_train)
 
-    totals: dict[str, float] = {}
-    n_batches = 0
+    metric_keys = ("aux", "curriculum_scale", "eri", "forecast", "holdout", "recon", "total")
+    totals = {k: 0.0 for k in metric_keys}
+    model_cfg = unwrap_model(model).cfg
+    n_examples = 0.0
+    gap_sse = 0.0
+    gap_count = 0.0
+    routing_weight_sum = torch.zeros(model_cfg.n_experts, dtype=torch.float64, device=device)
+    routing_count = 0.0
     t0 = time.time()
 
     grad_ctx = torch.enable_grad() if is_train else torch.no_grad()
@@ -253,6 +320,7 @@ def run_epoch(
     with grad_ctx:
         for batch in loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            batch_size = batch["chl_obs"].shape[0]
 
             # zero_grad before forward so step ordering is unambiguous
             if is_train:
@@ -298,28 +366,64 @@ def run_epoch(
                     writer.add_scalar("train/holdout",           breakdown.get("holdout", 0.0),  global_step)
                     if amp_enabled and scaler is not None:
                         writer.add_scalar("train/amp_scale", scaler.get_scale(), global_step)
-                    if "routing_weights" in outputs:
-                        ent = routing_entropy(outputs["routing_weights"].detach())
-                        writer.add_scalar("train/routing_entropy", ent, global_step)
 
             for k, v in breakdown.items():
-                totals[k] = totals.get(k, 0.0) + v
+                totals[k] = totals.get(k, 0.0) + (v * batch_size)
+            n_examples += batch_size
 
             with torch.no_grad():
-                last_obs_mask = batch["obs_mask"][:, -1]
-                last_chl      = batch["chl_obs"][:, -1]
-                pred_recon    = outputs["recon"].squeeze(1).float()
-                rmse = masked_rmse(pred_recon, last_chl.float(), last_obs_mask)
-                totals["recon_rmse"] = totals.get("recon_rmse", 0.0) + (rmse if math.isfinite(rmse) else 0.0)
+                last_chl = batch["chl_obs"][:, -1]
+                pred_recon = outputs["recon"].squeeze(1).float()
 
-            n_batches += 1
+                if is_train and "holdout_mask" in outputs:
+                    sse, count = compute_masked_rmse_stats(
+                        pred_recon, last_chl, outputs["holdout_mask"]
+                    )
+                    gap_sse += sse
+                    gap_count += count
+                elif not is_train:
+                    holdout_mask = stable_holdout_mask(
+                        batch["obs_mask"][:, -1],
+                        batch["land_mask"],
+                        model_cfg.holdout_frac,
+                    )
+                    if holdout_mask.any():
+                        eval_batch = build_gap_eval_batch(batch, holdout_mask)
+                        with autocast(device_type=amp_device, enabled=amp_enabled):
+                            gap_outputs = model(eval_batch)
+                        gap_pred = gap_outputs["recon"].squeeze(1).float()
+                        sse, count = compute_masked_rmse_stats(gap_pred, last_chl, holdout_mask)
+                        gap_sse += sse
+                        gap_count += count
+
+                if "routing_weights" in outputs:
+                    batch_routing_sum = outputs["routing_weights"].detach().sum(dim=0, dtype=torch.float64)
+                    routing_weight_sum += batch_routing_sum
+                    routing_count += batch_size
 
     elapsed = time.time() - t0
-    metrics = {k: v / max(n_batches, 1) for k, v in totals.items()}
-    metrics["epoch_time_s"] = elapsed
+    keys = list(metric_keys)
+    totals_tensor = torch.tensor([totals[k] for k in keys], dtype=torch.float64, device=device)
+    totals_tensor = reduce_sum_tensor(totals_tensor, world_size)
 
-    # Average metrics across all DDP ranks so rank 0 logs the global value
-    metrics = reduce_dict(metrics, world_size)
+    counts_tensor = torch.tensor(
+        [n_examples, gap_sse, gap_count, routing_count],
+        dtype=torch.float64,
+        device=device,
+    )
+    counts_tensor = reduce_sum_tensor(counts_tensor, world_size)
+    n_examples, gap_sse, gap_count, routing_count = counts_tensor.tolist()
+
+    elapsed_tensor = torch.tensor(elapsed, dtype=torch.float64, device=device)
+    elapsed_tensor = reduce_max_tensor(elapsed_tensor, world_size)
+
+    metrics = {k: totals_tensor[i].item() / max(n_examples, 1.0) for i, k in enumerate(keys)}
+    metrics["epoch_time_s"] = elapsed_tensor.item()
+    metrics["gap_rmse"] = math.sqrt(gap_sse / gap_count) if gap_count > 0 else float("nan")
+
+    routing_weight_sum = reduce_sum_tensor(routing_weight_sum, world_size)
+    if routing_count > 0:
+        metrics["routing_entropy"] = routing_entropy((routing_weight_sum / routing_count).float())
 
     return metrics, global_step
 
@@ -470,7 +574,7 @@ def main() -> None:
     model = MARASSModel(cfg).to(device)
 
     if using_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     if is_main:
         log.info(f"Parameters: {sum(p.numel() for p in unwrap_model(model).parameters()):,}")
@@ -577,7 +681,9 @@ def main() -> None:
                 writer.add_scalar("val/recon",      val_metrics["recon"],      epoch)
                 writer.add_scalar("val/forecast",   val_metrics["forecast"],   epoch)
                 writer.add_scalar("val/eri",        val_metrics["eri"],        epoch)
-                writer.add_scalar("val/recon_rmse", val_metrics["recon_rmse"], epoch)
+                writer.add_scalar("train_epoch/routing_entropy", train_metrics["routing_entropy"], epoch)
+                writer.add_scalar("train_epoch/gap_rmse",        train_metrics["gap_rmse"],        epoch)
+                writer.add_scalar("val/gap_rmse",                val_metrics["gap_rmse"],          epoch)
 
             vram_str = ""
             if device.type == "cuda":
@@ -591,7 +697,7 @@ def main() -> None:
                 f"(R {train_metrics['recon']:.4f} "
                 f"F {train_metrics['forecast']:.4f} "
                 f"E {train_metrics['eri']:.4f}) | "
-                f"val {val_loss:.4f} rmse {val_metrics['recon_rmse']:.4f} | "
+                f"val {val_loss:.4f} gap_rmse {val_metrics['gap_rmse']:.4f} | "
                 f"{train_metrics['epoch_time_s']:.0f}s{vram_str}"
             )
 
