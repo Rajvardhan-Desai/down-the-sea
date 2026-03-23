@@ -32,7 +32,7 @@ Default weights:
     w_recon    = 1.0   primary task
     w_forecast = 0.5   secondary task (harder, lower weight early in training)
     w_eri      = 0.3   auxiliary classification task
-    w_aux      = 0.01  load-balancing regulariser
+    w_aux      = 0.001  load-balancing regulariser (reduced from 0.01)
 
 Curriculum (optional):
     Pass step / total_steps to MARASSLoss.forward() to ramp up forecast
@@ -62,6 +62,7 @@ def recon_loss(
     target: Tensor,
     obs_mask: Tensor,
     land_mask: Tensor,
+    holdout_mask: Tensor | None = None,
 ) -> Tensor:
     """
     Heteroscedastic negative log-likelihood loss for Chl-a reconstruction.
@@ -97,8 +98,11 @@ def recon_loss(
     valid_t   = obs_mask[:, -1]                            # (B, H, W)
 
     # Valid supervision mask: observed ocean pixels only
+    # Exclude pixels that were held out (they are supervised by holdout_recon_loss)
     ocean = 1.0 - land_mask                                # (B, H, W)
     sup_mask = valid_t * ocean                             # (B, H, W)
+    if holdout_mask is not None:
+        sup_mask = sup_mask * (1.0 - holdout_mask)        # remove held-out pixels
 
     pred_sq   = pred.squeeze(1)                            # (B, H, W)
     lv_sq     = log_var.squeeze(1)                         # (B, H, W)
@@ -255,7 +259,7 @@ def eri_loss(
     if bloom_mask is not None:
         # Any timestep with bloom activity → upweight that pixel
         bloom_any = (bloom_mask.sum(dim=1) > 0).float()   # (B, H, W)
-        weight = weight * (1.0 + 9.0 * bloom_any)         # 10× weight on bloom pixels
+        weight = weight * (1.0 + 5.0 * bloom_any)         # 6× weight on bloom pixels
 
     n_valid = weight.sum().clamp(min=1.0)
     return (pixel_loss * weight).sum() / n_valid
@@ -335,7 +339,7 @@ class MARASSLoss(nn.Module):
         loss.backward()
 
         # breakdown is a dict of scalar losses for logging:
-        # {"total", "recon", "forecast", "eri", "aux"}
+        # {"total", "recon", "forecast", "eri", "aux", "holdout", "curriculum_scale"}
     """
 
     def __init__(
@@ -382,12 +386,15 @@ class MARASSLoss(nn.Module):
         bloom_mask  = batch["bloom_mask"]                  # (B, T, H, W)
 
         # --- Reconstruction ---
+        # Pass holdout_mask so NLL supervision excludes held-out pixels —
+        # those are supervised separately by holdout_recon_loss via MSE.
         l_recon = recon_loss(
-            pred      = outputs["recon"],
-            log_var   = outputs["uncertainty"],
-            target    = chl_obs,
-            obs_mask  = obs_mask,
-            land_mask = land_mask,
+            pred         = outputs["recon"],
+            log_var      = outputs["uncertainty"],
+            target       = chl_obs,
+            obs_mask     = obs_mask,
+            land_mask    = land_mask,
+            holdout_mask = outputs.get("holdout_mask"),
         )
 
         # --- Forecast ---
