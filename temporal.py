@@ -145,19 +145,30 @@ class ConvLSTMLayer(nn.Module):
     Unrolls a ConvLSTMCell over T time steps.
 
     Input:  (B, T, D, H, W)
-    Output: final hidden state  (B, D, H, W)
+    Output:
+        final hidden state      (B, D, H, W)
+        or full hidden sequence (B, T, D, H, W)
     """
 
     def __init__(self, in_channels: int, hidden_dim: int, kernel_size: int = 3) -> None:
         super().__init__()
         self.cell = ConvLSTMCell(in_channels, hidden_dim, kernel_size)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, return_sequence: bool = False) -> Tensor:
         B, T, D, H, W = x.shape
+        if T == 0:
+            raise ValueError("ConvLSTMLayer requires a non-empty sequence (T > 0).")
+
         state = None
+        outputs: list[Tensor] = []
         for t in range(T):
             h, c = self.cell(x[:, t], state)
             state = (h, c)
+            if return_sequence:
+                outputs.append(h)
+
+        if return_sequence:
+            return torch.stack(outputs, dim=1)
         return h   # final hidden state: (B, D, H, W)
 
 
@@ -199,15 +210,15 @@ class TemporalModule(nn.Module):
         """
         # Ensure contiguous memory layout before ConvLSTM unrolling
         fused = fused.contiguous()
+        B, T, D, H, W = fused.shape
 
-        # Layer 1: process raw fused sequence
-        h1 = self.norm1(self.layer1(fused))          # (B, D, H, W)
+        # Layer 1: process the full fused sequence and keep per-step states
+        h1_seq = self.layer1(fused, return_sequence=True)                     # (B, T, D, H, W)
+        h1_seq = self.norm1(h1_seq.reshape(B * T, D, H, W)).reshape(B, T, D, H, W)
 
-        # Layer 2: refine — feed h1 as a single-step sequence
-        # Expand to (B, 1, D, H, W) so ConvLSTMLayer sees T=1
-        # but also condition on the original sequence mean as context
+        # Layer 2: refine the full temporal sequence, biased by global context
         seq_mean = fused.mean(dim=1)                 # (B, D, H, W)
-        h2_input = (h1 + seq_mean).unsqueeze(1)      # (B, 1, D, H, W)
+        h2_input = h1_seq + seq_mean.unsqueeze(1)    # (B, T, D, H, W)
         h2 = self.norm2(self.layer2(h2_input))       # (B, D, H, W)
 
         # Residual: add sequence mean to preserve input signal
@@ -257,6 +268,13 @@ def run_smoke_test() -> None:
         print("\nSmoke test passed.")
     else:
         raise RuntimeError("Smoke test failed — see above.")
+
+    try:
+        module(fused[:, :0])
+    except ValueError:
+        print("Empty sequence guard: OK")
+    else:
+        raise RuntimeError("Empty sequence guard failed.")
 
 
 if __name__ == "__main__":
