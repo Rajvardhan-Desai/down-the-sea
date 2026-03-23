@@ -76,6 +76,11 @@ class ModelConfig:
     # ERI ordinal levels
     n_eri_levels: int = 5
 
+    # Holdout fraction — fraction of observed pixels randomly zeroed during
+    # training to force the model to reconstruct from context, not memorisation.
+    # Generates supervised gap-filling signal on held-out pixels.
+    holdout_frac: float = 0.20
+
 
 # ======================================================================
 # Output heads
@@ -223,6 +228,19 @@ class MARASSModel(nn.Module):
         optical = torch.stack([chl_obs, obs_mask], dim=2)                           # (B, T, 2, H, W)
         masks   = torch.stack([obs_mask, mcar_mask, mnar_mask, bloom_mask], dim=2)  # (B, T, 4, H, W)
 
+        # During training, randomly hold out a fraction of observed pixels in the
+        # last timestep of the optical stream. This forces the model to reconstruct
+        # those pixels from surrounding context + physics rather than copying input,
+        # generating direct gradient signal on gap-filling quality.
+        holdout_mask = None
+        if self.training and cfg.holdout_frac > 0:
+            obs_last = obs_mask[:, -1]                              # (B, H, W)
+            rand     = torch.rand_like(obs_last)
+            holdout_mask = ((obs_last > 0.5) & (rand < cfg.holdout_frac)).float()  # (B, H, W)
+            optical = optical.clone()
+            optical[:, -1, 0] = optical[:, -1, 0] * (1.0 - holdout_mask)  # zero chl_obs
+            optical[:, -1, 1] = optical[:, -1, 1] * (1.0 - holdout_mask)  # zero obs_mask
+
         # ------------------------------------------------------------------
         # 2. Encode (five independent streams)
         # ------------------------------------------------------------------
@@ -263,6 +281,8 @@ class MARASSModel(nn.Module):
         }
         if routing_weights is not None:
             outputs["routing_weights"] = routing_weights    # (B, n_experts)
+        if holdout_mask is not None:
+            outputs["holdout_mask"] = holdout_mask          # (B, H, W) — training only
 
         return outputs
 
