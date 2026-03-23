@@ -301,4 +301,4 @@ def run_sanity_check(patch_dir: str | Path, batch_size: int = 4) -> None:
 
 
 if __name__ == "__main__":
-    run_sanity_check(patch_dir="data/patches", batch_size=4)
+    run_sanity_check(patch_dir="/kaggle/input/datasets/rajvardhandesai27/down-the-sea/patches", batch_size=4)
