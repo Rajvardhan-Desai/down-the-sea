@@ -16,7 +16,7 @@ Architecture:
         │   (GraphConv ×2)     propagates valid-pixel context into gap interiors
         │                      output: (B, T, D, H, W)
         │
-        └── TemporalMixer      lightweight 1×1 conv across T
+        └── TemporalMixer      lightweight depthwise conv across T
                                shares missingness context across time steps
                                output: (B, T, D, H, W)
 
@@ -135,13 +135,14 @@ class GridGraphConv(nn.Module):
 
     def __init__(self, embed_dim: int) -> None:
         super().__init__()
-        # Aggregate neighbor messages
-        self.msg_conv = nn.Conv2d(
-            embed_dim, embed_dim,
-            kernel_size=3, padding=1,
-            groups=embed_dim,   # depthwise — cheap, per-channel aggregation
-            bias=False,
-        )
+        neighbor_kernel = torch.zeros(embed_dim, 1, 3, 3)
+        neighbor_kernel[:, 0, 0, 1] = 1.0  # top
+        neighbor_kernel[:, 0, 1, 0] = 1.0  # left
+        neighbor_kernel[:, 0, 1, 2] = 1.0  # right
+        neighbor_kernel[:, 0, 2, 1] = 1.0  # bottom
+        self.register_buffer("neighbor_kernel", neighbor_kernel, persistent=False)
+        self.register_buffer("count_kernel", neighbor_kernel[:1].clone(), persistent=False)
+
         # Update rule: combine self + aggregated neighbors
         self.update = nn.Sequential(
             nn.Conv2d(embed_dim * 2, embed_dim, kernel_size=1),
@@ -155,49 +156,29 @@ class GridGraphConv(nn.Module):
         x_valid = x * obs_mask                              # (N, D, H, W)
 
         x_valid_padded = F.pad(x_valid, (1, 1, 1, 1), mode="replicate")
+        neighbor_kernel = self.neighbor_kernel
+        if neighbor_kernel.dtype != x_valid.dtype:
+            neighbor_kernel = neighbor_kernel.to(dtype=x_valid.dtype)
         neighbor_sum = F.conv2d(
             x_valid_padded,
-            weight=self._neighbor_kernel(x.shape[1], x.device, x.dtype),
-            groups=x.shape[1],
+            weight=neighbor_kernel,
+            groups=neighbor_kernel.shape[0],
         )                                                   # (N, D, H, W)
 
         # Count valid neighbors per pixel for normalization
         obs_padded = F.pad(obs_mask, (1, 1, 1, 1), mode="replicate")
+        count_kernel = self.count_kernel
+        if count_kernel.dtype != obs_mask.dtype:
+            count_kernel = count_kernel.to(dtype=obs_mask.dtype)
         valid_count = F.conv2d(
             obs_padded,
-            weight=self._count_kernel(x.device, x.dtype),
+            weight=count_kernel,
         ).clamp(min=1.0)                                    # (N, 1, H, W)
 
         neighbor_agg = neighbor_sum / valid_count           # (N, D, H, W)
 
         # Update: combine self-feature with aggregated neighbor context
         return self.update(torch.cat([x, neighbor_agg], dim=1))
-
-    @staticmethod
-    def _neighbor_kernel(channels: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-        """
-        3×3 depthwise kernel that sums the 4 cardinal neighbors (not center).
-            0 1 0
-            1 0 1
-            0 1 0
-        """
-        k = torch.zeros(channels, 1, 3, 3, device=device, dtype=dtype)
-        k[:, 0, 0, 1] = 1.0  # top
-        k[:, 0, 1, 0] = 1.0  # left
-        k[:, 0, 1, 2] = 1.0  # right
-        k[:, 0, 2, 1] = 1.0  # bottom
-        return k
-
-    @staticmethod
-    def _count_kernel(device: torch.device, dtype: torch.dtype) -> Tensor:
-        """Same as neighbor kernel but single-channel for counting valid neighbors."""
-        k = torch.zeros(1, 1, 3, 3, device=device, dtype=dtype)
-        k[0, 0, 0, 1] = 1.0
-        k[0, 0, 1, 0] = 1.0
-        k[0, 0, 1, 2] = 1.0
-        k[0, 0, 2, 1] = 1.0
-        return k
-
 
 class SpatialGNN(nn.Module):
     """
@@ -241,7 +222,7 @@ class TemporalMixer(nn.Module):
     Output: (B, T, D, H, W)
     """
 
-    def __init__(self, embed_dim: int, T: int) -> None:
+    def __init__(self, embed_dim: int) -> None:
         super().__init__()
         # Depthwise Conv1d along T: each of the D channels gets its own kernel.
         # This is cheap and keeps spatial positions independent.
@@ -299,7 +280,7 @@ class MaskNet(nn.Module):
 
         self.type_embedder = MissTypeEmbedder(embed_dim)
         self.spatial_gnn   = SpatialGNN(embed_dim, n_rounds=gnn_rounds)
-        self.temporal_mix  = TemporalMixer(embed_dim, T)
+        self.temporal_mix  = TemporalMixer(embed_dim)
 
     def forward(self, masks: Tensor) -> Tensor:
         B, T, C, H, W = masks.shape
