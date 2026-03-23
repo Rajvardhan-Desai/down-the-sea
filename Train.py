@@ -176,7 +176,8 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--w-recon",    type=float, default=1.0)
     p.add_argument("--w-forecast", type=float, default=0.5)
     p.add_argument("--w-eri",      type=float, default=0.3)
-    p.add_argument("--w-aux",      type=float, default=0.01)
+    p.add_argument("--w-aux",      type=float, default=0.001)
+    p.add_argument("--w-holdout",  type=float, default=0.5)
 
     # DataLoader
     p.add_argument("--num-workers", type=int, default=2)
@@ -294,6 +295,7 @@ def run_epoch(
                     writer.add_scalar("train/grad_norm",        grad_norm,             global_step)
                     writer.add_scalar("train/lr",               scheduler.get_last_lr()[0], global_step)
                     writer.add_scalar("train/curriculum_scale", breakdown["curriculum_scale"], global_step)
+                    writer.add_scalar("train/holdout",           breakdown.get("holdout", 0.0),  global_step)
                     if amp_enabled and scaler is not None:
                         writer.add_scalar("train/amp_scale", scaler.get_scale(), global_step)
                     if "routing_weights" in outputs:
@@ -505,6 +507,7 @@ def main() -> None:
             forecast=args.w_forecast,
             eri=args.w_eri,
             aux=args.w_aux,
+            holdout=args.w_holdout,
         )
     ).to(device)
 
