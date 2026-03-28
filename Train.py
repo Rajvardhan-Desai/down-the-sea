@@ -58,6 +58,7 @@ from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
+from augment import augment_batch
 from dataset import build_dataloaders, MARASSDataset
 from loss import MARASSLoss, LossWeights
 from model import MARASSModel, ModelConfig
@@ -199,7 +200,7 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--w-recon",    type=float, default=1.0)
     p.add_argument("--w-forecast", type=float, default=0.5)
     p.add_argument("--w-eri",      type=float, default=0.3)
-    p.add_argument("--w-aux",      type=float, default=0.001)
+    p.add_argument("--w-aux",      type=float, default=0.01)
     p.add_argument("--w-holdout",  type=float, default=0.5)
 
     # DataLoader
@@ -305,7 +306,7 @@ def run_epoch(
 
     model.train(is_train)
 
-    metric_keys = ("aux", "curriculum_scale", "eri", "forecast", "holdout", "recon", "total")
+    metric_keys = ("aux", "bloom_fcast", "curriculum_scale", "eri", "forecast", "holdout", "recon", "total")
     totals = {k: 0.0 for k in metric_keys}
     model_cfg = unwrap_model(model).cfg
     n_examples = 0.0
@@ -321,6 +322,10 @@ def run_epoch(
         for batch in loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             batch_size = batch["chl_obs"].shape[0]
+
+            # Spatial augmentation (flips + 90° rotations) — training only
+            if is_train:
+                batch = augment_batch(batch)
 
             # zero_grad before forward so step ordering is unambiguous
             if is_train:
@@ -364,6 +369,7 @@ def run_epoch(
                     writer.add_scalar("train/lr",               scheduler.get_last_lr()[0], global_step)
                     writer.add_scalar("train/curriculum_scale", breakdown["curriculum_scale"], global_step)
                     writer.add_scalar("train/holdout",           breakdown.get("holdout", 0.0),  global_step)
+                    writer.add_scalar("train/bloom_fcast",       breakdown.get("bloom_fcast", 0.0), global_step)
                     if amp_enabled and scaler is not None:
                         writer.add_scalar("train/amp_scale", scaler.get_scale(), global_step)
 
@@ -610,9 +616,11 @@ def main() -> None:
             recon=args.w_recon,
             forecast=args.w_forecast,
             eri=args.w_eri,
+            bloom_fcast=0.3,
             aux=args.w_aux,
             holdout=args.w_holdout,
-        )
+        ),
+        bloom_threshold=10.85,
     ).to(device)
 
     # ------------------------------------------------------------------
@@ -681,6 +689,7 @@ def main() -> None:
                 writer.add_scalar("val/recon",      val_metrics["recon"],      epoch)
                 writer.add_scalar("val/forecast",   val_metrics["forecast"],   epoch)
                 writer.add_scalar("val/eri",        val_metrics["eri"],        epoch)
+                writer.add_scalar("val/bloom_fcast", val_metrics.get("bloom_fcast", 0.0), epoch)
                 writer.add_scalar("train_epoch/routing_entropy", train_metrics["routing_entropy"], epoch)
                 writer.add_scalar("train_epoch/gap_rmse",        train_metrics["gap_rmse"],        epoch)
                 writer.add_scalar("val/gap_rmse",                val_metrics["gap_rmse"],          epoch)
@@ -696,7 +705,8 @@ def main() -> None:
                 f"train {train_metrics['total']:.4f} "
                 f"(R {train_metrics['recon']:.4f} "
                 f"F {train_metrics['forecast']:.4f} "
-                f"E {train_metrics['eri']:.4f}) | "
+                f"E {train_metrics['eri']:.4f} "
+                f"B {train_metrics.get('bloom_fcast', 0.0):.4f}) | "
                 f"val {val_loss:.4f} gap_rmse {val_metrics['gap_rmse']:.4f} | "
                 f"{train_metrics['epoch_time_s']:.0f}s{vram_str}"
             )
