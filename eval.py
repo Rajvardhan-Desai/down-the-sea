@@ -553,6 +553,159 @@ def save_summary_figures(
 
 
 # ======================================================================
+# Bloom forecast accumulator
+# ======================================================================
+
+class BloomForecastAccumulator:
+    """
+    Accumulates per-step bloom detection metrics: precision, recall, F1.
+    Bloom targets are derived from target_chl at a normalized threshold.
+    """
+
+    def __init__(self, h_fcast: int, bloom_threshold: float = 10.85):
+        self.h_fcast = h_fcast
+        self.bloom_threshold = bloom_threshold
+        self.tp = [0] * h_fcast
+        self.fp = [0] * h_fcast
+        self.fn = [0] * h_fcast
+        self.tn = [0] * h_fcast
+        self.n_pixels = [0] * h_fcast
+
+    def update(
+        self,
+        bloom_logits: torch.Tensor,   # (B, H_fcast, H, W)
+        target_chl:   torch.Tensor,   # (B, H_fcast, H, W)
+        target_mask:  torch.Tensor,   # (B, H_fcast, H, W)
+        land_mask:    torch.Tensor,   # (B, H, W)
+    ) -> None:
+        ocean = (1.0 - land_mask.float()).unsqueeze(1)
+        valid = (target_mask.float() * ocean).bool().cpu()
+        pred_bloom = (bloom_logits.float().cpu() > 0.0)   # logit > 0 → prob > 0.5
+        true_bloom = (target_chl.float().cpu() > self.bloom_threshold)
+
+        for h in range(self.h_fcast):
+            m = valid[:, h]
+            if not m.any():
+                continue
+            p = pred_bloom[:, h][m]
+            t = true_bloom[:, h][m]
+            self.tp[h] += int((p & t).sum())
+            self.fp[h] += int((p & ~t).sum())
+            self.fn[h] += int((~p & t).sum())
+            self.tn[h] += int((~p & ~t).sum())
+            self.n_pixels[h] += int(m.sum())
+
+    def compute(self) -> dict:
+        results = {}
+        all_f1 = []
+        for h in range(self.h_fcast):
+            tp, fp, fn = self.tp[h], self.fp[h], self.fn[h]
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+            bloom_rate = (tp + fn) / self.n_pixels[h] if self.n_pixels[h] > 0 else 0.0
+            results[f"step_{h+1}"] = {
+                "precision":  float(prec),
+                "recall":     float(rec),
+                "f1":         float(f1),
+                "tp": tp, "fp": fp, "fn": fn,
+                "bloom_rate": float(bloom_rate),
+            }
+            all_f1.append(f1)
+        results["macro_f1"] = float(np.mean(all_f1)) if all_f1 else 0.0
+        return results
+
+
+# ======================================================================
+# Ecosystem impact accumulator
+# ======================================================================
+
+class EcosystemImpactAccumulator:
+    """Accumulates ecosystem impact score statistics."""
+
+    def __init__(self):
+        self.scores = []
+        self.high_impact_count = 0
+        self.total_ocean_pixels = 0
+
+    def update(self, impact: torch.Tensor, land_mask: torch.Tensor) -> None:
+        ocean = (1.0 - land_mask.float()).bool().cpu()
+        vals = impact.float().cpu()[ocean].numpy()
+        if len(vals) > 0:
+            self.scores.append(vals)
+            self.high_impact_count += int((vals > 0.6).sum())
+            self.total_ocean_pixels += len(vals)
+
+    def compute(self) -> dict:
+        if not self.scores:
+            return {}
+        all_scores = np.concatenate(self.scores)
+        return {
+            "mean":           float(np.mean(all_scores)),
+            "std":            float(np.std(all_scores)),
+            "median":         float(np.median(all_scores)),
+            "p90":            float(np.percentile(all_scores, 90)),
+            "p95":            float(np.percentile(all_scores, 95)),
+            "p99":            float(np.percentile(all_scores, 99)),
+            "max":            float(np.max(all_scores)),
+            "high_impact_frac": float(self.high_impact_count / max(self.total_ocean_pixels, 1)),
+        }
+
+
+def save_bloom_forecast_figure(
+    bloom_probs:  np.ndarray,   # (H_fcast, H, W)  — sigmoid probabilities
+    target_chl:   np.ndarray,   # (H_fcast, H, W)
+    target_mask:  np.ndarray,   # (H_fcast, H, W)
+    land_mask:    np.ndarray,   # (H, W)
+    impact:       np.ndarray,   # (H, W)
+    path: Path,
+    idx:  int,
+    bloom_threshold: float = 10.85,
+) -> None:
+    """Save bloom probability maps + ecosystem impact for one sample."""
+    plt = _plt()
+    if plt is None:
+        return
+    H_fcast = bloom_probs.shape[0]
+    fig, axes = plt.subplots(2, H_fcast + 1, figsize=(4 * (H_fcast + 1), 7))
+
+    land = land_mask.astype(bool)
+
+    # Row 1: bloom probability per step
+    for t in range(H_fcast):
+        prob_vis = np.where(land, np.nan, bloom_probs[t])
+        axes[0, t].imshow(prob_vis, cmap="YlOrRd", vmin=0, vmax=1, origin="lower")
+        axes[0, t].set_title(f"Bloom prob t+{t+1}")
+        axes[0, t].axis("off")
+
+    # Row 1, last column: ecosystem impact
+    impact_vis = np.where(land, np.nan, impact)
+    im = axes[0, -1].imshow(impact_vis, cmap="hot_r", vmin=0, vmax=1, origin="lower")
+    axes[0, -1].set_title("Ecosystem impact")
+    axes[0, -1].axis("off")
+    plt.colorbar(im, ax=axes[0, -1], shrink=0.8)
+
+    # Row 2: ground truth bloom (binary from target_chl)
+    for t in range(H_fcast):
+        v = target_mask[t].astype(bool) & ~land
+        truth = np.where(v, (target_chl[t] > bloom_threshold).astype(float), np.nan)
+        axes[1, t].imshow(truth, cmap="YlOrRd", vmin=0, vmax=1, origin="lower")
+        axes[1, t].set_title(f"True bloom t+{t+1}")
+        axes[1, t].axis("off")
+
+    # Row 2, last column: max bloom prob across steps
+    max_prob = np.where(land, np.nan, bloom_probs.max(axis=0))
+    axes[1, -1].imshow(max_prob, cmap="YlOrRd", vmin=0, vmax=1, origin="lower")
+    axes[1, -1].set_title("Max bloom prob")
+    axes[1, -1].axis("off")
+
+    plt.suptitle(f"Bloom forecast + Ecosystem impact — sample {idx}", y=1.01)
+    plt.tight_layout()
+    plt.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close()
+
+
+# ======================================================================
 # Forward with routing (eval mode)
 # ======================================================================
 
@@ -587,11 +740,10 @@ def forward_with_routing(model, batch):
     decoded, routing_w = m.decoder(state, return_routing=True)
 
     return {
-        "recon":          m.recon_head(decoded),
-        "forecast":       m.forecast_head(decoded),
-        "uncertainty":    m.uncertainty_head(decoded),
-        "eri":            m.eri_head(decoded),
-        "bloom_forecast": m.bloom_fcast_head(decoded),
+        "recon":       m.recon_head(decoded),
+        "forecast":    m.forecast_head(decoded),
+        "uncertainty": m.uncertainty_head(decoded),
+        "eri":         m.eri_head(decoded),
     }, routing_w
 
 
@@ -618,6 +770,7 @@ def evaluate(args: argparse.Namespace) -> None:
     from model import MARASSModel, ModelConfig
     from loss import build_eri_target
     from dataset import build_dataloaders
+    from model import compute_ecosystem_impact
 
     cfg   = ModelConfig()
     model = MARASSModel(cfg).to(device)
@@ -644,6 +797,8 @@ def evaluate(args: argparse.Namespace) -> None:
     eri_acc     = ERIAccumulator(cfg.n_eri_levels)
     uncert_acc  = UncertaintyAccumulator()
     routing_acc = RoutingAccumulator(cfg.n_experts)
+    bloom_acc   = BloomForecastAccumulator(cfg.H_fcast, bloom_threshold=10.85)
+    impact_acc  = EcosystemImpactAccumulator()
 
     n_figs = 0
     n_batches = len(test_loader)
@@ -680,6 +835,20 @@ def evaluate(args: argparse.Namespace) -> None:
             )
             routing_acc.update(routing_w)
 
+            # Bloom forecast metrics
+            if "bloom_forecast" in outputs:
+                bloom_acc.update(
+                    outputs["bloom_forecast"], target_chl, tgt_mask, land_mask,
+                )
+
+                # Ecosystem impact scoring
+                bloom_probs = torch.sigmoid(outputs["bloom_forecast"])
+                impact = compute_ecosystem_impact(
+                    bloom_probs, outputs["forecast"],
+                    outputs["uncertainty"], batch["static"], land_mask,
+                )
+                impact_acc.update(impact, land_mask)
+
             # Per-sample figures
             if not args.no_figures and n_figs < args.n_figures:
                 B = outputs["recon"].shape[0]
@@ -703,6 +872,25 @@ def evaluate(args: argparse.Namespace) -> None:
                         path          = fig_dir / f"forecast_{gidx:04d}.png",
                         idx           = gidx,
                     )
+                    # Bloom forecast + ecosystem impact figure
+                    if "bloom_forecast" in outputs:
+                        bf_probs = torch.sigmoid(outputs["bloom_forecast"][si]).cpu().float().numpy()
+                        sample_impact = compute_ecosystem_impact(
+                            torch.sigmoid(outputs["bloom_forecast"][si:si+1]),
+                            outputs["forecast"][si:si+1],
+                            outputs["uncertainty"][si:si+1],
+                            batch["static"][si:si+1],
+                            land_mask[si:si+1],
+                        )[0].cpu().float().numpy()
+                        save_bloom_forecast_figure(
+                            bloom_probs   = bf_probs,
+                            target_chl    = target_chl[si].cpu().float().numpy(),
+                            target_mask   = tgt_mask[si].cpu().float().numpy(),
+                            land_mask     = land_mask[si].cpu().float().numpy(),
+                            impact        = sample_impact,
+                            path          = fig_dir / f"bloom_impact_{gidx:04d}.png",
+                            idx           = gidx,
+                        )
                     n_figs += 1
 
     log.info("Computing metrics...")
@@ -712,6 +900,8 @@ def evaluate(args: argparse.Namespace) -> None:
     eri_result, cm          = eri_acc.compute()
     uncert_result, cal_bins = uncert_acc.compute()
     routing_result          = routing_acc.compute()
+    bloom_result            = bloom_acc.compute()
+    impact_result           = impact_acc.compute()
 
     # --- Print ---
     print("\n" + "=" * 62)
@@ -760,6 +950,31 @@ def evaluate(args: argparse.Namespace) -> None:
         print(f"  Utilisation  : {routing_result['utilisation']:.4f}")
     print("=" * 62)
 
+    print("\n" + "=" * 62)
+    print("BLOOM LEAD-TIME PREDICTION")
+    print("=" * 62)
+    if bloom_result:
+        for step_key in sorted(k for k in bloom_result if k.startswith("step_")):
+            m = bloom_result[step_key]
+            print(f"  {step_key}:  Prec {m['precision']:.4f}   Rec {m['recall']:.4f}   "
+                  f"F1 {m['f1']:.4f}   bloom_rate {m['bloom_rate']:.6f}")
+        print(f"\n  Macro F1     : {bloom_result.get('macro_f1', 0):.4f}")
+    print("=" * 62)
+
+    print("\n" + "=" * 62)
+    print("ECOSYSTEM IMPACT ANALYSIS")
+    print("=" * 62)
+    if impact_result:
+        print(f"  Mean score   : {impact_result['mean']:.4f}")
+        print(f"  Median       : {impact_result['median']:.4f}")
+        print(f"  Std          : {impact_result['std']:.4f}")
+        print(f"  P90          : {impact_result['p90']:.4f}")
+        print(f"  P95          : {impact_result['p95']:.4f}")
+        print(f"  P99          : {impact_result['p99']:.4f}")
+        print(f"  Max          : {impact_result['max']:.4f}")
+        print(f"  High impact  : {impact_result['high_impact_frac']*100:.2f}% of ocean pixels (score > 0.6)")
+    print("=" * 62)
+
     # --- Save outputs ---
     all_metrics = {
         "checkpoint":     str(args.ckpt),
@@ -770,6 +985,8 @@ def evaluate(args: argparse.Namespace) -> None:
         "eri":            eri_result,
         "uncertainty":    uncert_result,
         "routing":        routing_result,
+        "bloom_forecast": bloom_result,
+        "ecosystem_impact": impact_result,
     }
     with open(out_dir / "metrics.json", "w") as f:
         json.dump(all_metrics, f, indent=2)
