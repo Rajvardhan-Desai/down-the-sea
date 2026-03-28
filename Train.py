@@ -574,7 +574,7 @@ def main() -> None:
     model = MARASSModel(cfg).to(device)
 
     if using_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     if is_main:
         log.info(f"Parameters: {sum(p.numel() for p in unwrap_model(model).parameters()):,}")
