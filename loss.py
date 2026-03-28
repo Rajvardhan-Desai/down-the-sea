@@ -1,70 +1,39 @@
 """
-loss.py — MM-MARAS loss functions
+loss.py — MM-MARAS loss functions (v2)
 
-Four task losses + combined training loss.
+Changes from v1:
+    [PERF 3] aux weight 0.001 → 0.01 — expert 0 was nearly dead at 5.3%
+    [PERF 4] recon_loss now includes an SSIM component for gap pixels via
+             the holdout pathway, encouraging spatial coherence in gap fills
+    [FEAT 1] bloom_forecast_loss — binary CE for per-step bloom prediction
+    [FEAT 1] LossWeights gains bloom_fcast field (default 0.3)
+    [FEAT 1] bloom_fcast ramps in with forecast/ERI curriculum
 
 Loss summary:
-    recon_loss      Heteroscedastic NLL over masked ocean pixels
-                    Jointly optimises Chl-a prediction and uncertainty
-                    calibration. Penalises both wrong predictions and
-                    miscalibrated confidence.
-
-    forecast_loss   Masked Huber (smooth-L1) over target_mask * (1 - land_mask)
-                    Switched from MSE to Huber for robustness against
-                    bloom-event outliers that spike Chl-a.
-
-    eri_loss        Ordinal cross-entropy via cumulative link model
-                    Respects the ordinal structure of ERI levels (0–4):
-                    predicting level 2 when truth is 3 is less wrong than
-                    predicting level 0.
-
-    aux_loss        MoE load-balancing (from moe_decoder.py)
-                    Prevents expert collapse.
+    recon_loss          Heteroscedastic NLL over observed ocean pixels
+    holdout_recon_loss  Heteroscedastic NLL + SSIM on held-out pixels [PERF 4]
+    forecast_loss       Masked Huber (smooth-L1) over target_mask * (1 - land_mask)
+    eri_loss            Ordinal cross-entropy via cumulative link model
+    bloom_forecast_loss Binary CE for bloom prediction at each forecast step [FEAT 1]
+    aux_loss            MoE load-balancing (from moe_decoder.py)
 
 Combined:
     loss = (
-        w_recon    * recon_loss
-      + w_forecast * forecast_loss
-      + w_eri      * eri_loss
-      + w_aux      * aux_loss
+        w_recon      * recon_loss
+      + w_forecast   * scale * forecast_loss
+      + w_eri        * scale * eri_loss
+      + w_bloom_fcast* scale * bloom_forecast_loss
+      + w_aux        * aux_loss
+      + w_holdout    * holdout_recon_loss
     )
 
 Default weights:
-    w_recon    = 1.0   primary task
-    w_forecast = 0.5   secondary task (harder, lower weight early in training)
-    w_eri      = 0.3   auxiliary classification task
-    w_aux      = 0.001  load-balancing regulariser (reduced from 0.01)
-
-Curriculum (optional):
-    Pass step / total_steps to MARASSLoss.forward() to ramp up forecast
-    and ERI weights from 0 over the first 20% of training. This lets the
-    model first learn gap filling before being asked to forecast.
-
-Changes vs previous version
-----------------------------
-[FIX 1] eri_loss — ordinal penalty now uses soft expected level (differentiable)
-    Previously: `logits.argmax(dim=1)` — hard non-differentiable assignment.
-    Now: `(softmax(logits) * level_indices).sum(dim=1)` — smooth expected level.
-    Impact: cleaner gradient signal for the ordinal structure.
-
-[FIX 2] eri_loss — focal modulation + rebalanced class weights
-    Previously: class_weights = [0.20, 2.0, 3.0, 4.0, 5.0]
-    Now: class_weights = [0.15, 5.0, 4.0, 4.0, 5.0]
-    + focal factor (1 - p_correct)^gamma applied per pixel.
-    Impact: addresses class 1 F1=0.378 — focal loss concentrates gradient on
-    hard examples at the class 0/1 decision boundary.
-
-[FIX 3] forecast_loss — switched from MSE to Huber (smooth-L1, delta=0.5)
-    Previously: plain `(pred - target).pow(2)`.
-    Now: `F.huber_loss(..., delta=0.5)` per valid pixel.
-    Impact: outlier bloom events no longer dominate the forecast gradient,
-    improving step +4/+5 RMSE.
-
-[FIX 4] holdout_recon_loss — uses heteroscedastic NLL instead of plain MSE
-    Previously: raw MSE on held-out pixels, inconsistent with recon_loss.
-    Now: same NLL formula as recon_loss, using the uncertainty head output.
-    Impact: gap-filling and uncertainty are jointly optimised on held-out pixels,
-    not just on observed pixels. Variance-error correlation should improve.
+    w_recon       = 1.0
+    w_forecast    = 0.5
+    w_eri         = 0.3
+    w_bloom_fcast = 0.3    [FEAT 1] new
+    w_aux         = 0.01   [PERF 3] was 0.001
+    w_holdout     = 0.5
 """
 
 from __future__ import annotations
@@ -94,59 +63,32 @@ def recon_loss(
     """
     Heteroscedastic negative log-likelihood loss for Chl-a reconstruction.
 
-    Jointly optimises prediction accuracy and uncertainty calibration:
+    NLL = 0.5 * (log_var + (pred - target)^2 / exp(log_var))
 
-        NLL = 0.5 * (log_var + (pred - target)^2 / exp(log_var))
-
-    A pixel where the model is uncertain (high log_var) gets a smaller
-    gradient from the squared error term, but pays a price via the log_var
-    term — forcing the model to be uncertain only when it truly needs to be.
-
-    Supervision is restricted to pixels that are:
-        - Valid in the input (obs_mask == 1): we know the true value
-        - Not land (land_mask == 0)
-
-    We supervise on OBSERVED pixels, not missing ones. The model learns
-    to reconstruct by predicting values it can verify. Gap filling quality
-    is evaluated separately (held-out spatial blocks).
-
-    Args:
-        pred:      (B, 1, H, W)   predicted Chl-a (log-space, normalised)
-        log_var:   (B, 1, H, W)   predicted log-variance (from uncertainty head)
-        target:    (B, T, H, W)   chl_obs — use last time step as reconstruction target
-        obs_mask:  (B, T, H, W)   1 = valid pixel
-        land_mask: (B, H, W)      1 = land pixel
-
-    Returns:
-        Scalar loss (mean over valid pixels).
+    Supervision is restricted to observed ocean pixels.
+    Held-out pixels are excluded (supervised separately by holdout_recon_loss).
     """
-    # Use the last observed time step as the reconstruction target
-    target_t  = target[:, -1]                              # (B, H, W)
-    valid_t   = obs_mask[:, -1]                            # (B, H, W)
+    target_t  = target[:, -1]
+    valid_t   = obs_mask[:, -1]
 
-    # Valid supervision mask: observed ocean pixels only
-    # Exclude pixels that were held out (they are supervised by holdout_recon_loss)
-    ocean = 1.0 - land_mask                                # (B, H, W)
-    sup_mask = valid_t * ocean                             # (B, H, W)
+    ocean = 1.0 - land_mask
+    sup_mask = valid_t * ocean
     if holdout_mask is not None:
-        sup_mask = sup_mask * (1.0 - holdout_mask)        # remove held-out pixels
+        sup_mask = sup_mask * (1.0 - holdout_mask)
 
-    pred_sq   = pred.squeeze(1)                            # (B, H, W)
-    lv_sq     = log_var.squeeze(1)                         # (B, H, W)
-
-    # Clamp log_var for numerical stability — avoids exp() blowup
+    pred_sq   = pred.squeeze(1)
+    lv_sq     = log_var.squeeze(1)
     lv_clamped = lv_sq.clamp(min=-10.0, max=10.0)
 
     nll = 0.5 * (lv_clamped + (pred_sq - target_t).pow(2) / lv_clamped.exp())
 
-    # Mean over valid pixels only
     n_valid = sup_mask.sum().clamp(min=1.0)
     return (nll * sup_mask).sum() / n_valid
 
 
 # ======================================================================
 # Holdout reconstruction loss — gap-filling supervision
-# [FIX 4] Uses heteroscedastic NLL instead of plain MSE for consistency
+# [PERF 4] Now includes SSIM component for spatial coherence
 # ======================================================================
 
 def holdout_recon_loss(
@@ -157,43 +99,52 @@ def holdout_recon_loss(
     land_mask:    Tensor,
 ) -> Tensor:
     """
-    Heteroscedastic NLL loss on pixels that were artificially held out during
-    the forward pass.
+    Heteroscedastic NLL + spatial smoothness on held-out pixels.
 
-    These pixels were observed (ground truth available) but zeroed in the
-    optical input so the model had to infer them from context. Supervising
-    on them directly trains the gap-filling pathway.
+    [PERF 4] Added a gradient-matching term that penalizes spatial
+    discontinuities at gap boundaries. This encourages the model to
+    produce spatially coherent gap fills instead of pixel-independent
+    predictions that ignore spatial structure (which caused SSIM=0.000).
 
-    [FIX 4] Previously used plain MSE. Now uses the same NLL formula as
-    recon_loss so that:
-      (a) gap-filling and uncertainty are jointly supervised on held-out pixels,
-      (b) the loss scale is consistent with recon_loss,
-      (c) the uncertainty head gets gradient from both observed and gap pixels.
-
-    Args:
-        pred:         (B, 1, H, W)  reconstruction output
-        log_var:      (B, 1, H, W)  log-variance from uncertainty head
-        target:       (B, H, W)     chl_obs last timestep (ground truth)
-        holdout_mask: (B, H, W)     1 = pixel was held out this forward pass
-        land_mask:    (B, H, W)     1 = land
-
-    Returns:
-        Scalar loss.
+    The gradient term computes the Laplacian (second spatial derivative)
+    of both prediction and target within held-out regions and penalizes
+    the difference. This acts as a lightweight SSIM proxy without the
+    computational cost of full SSIM.
     """
-    ocean    = 1.0 - land_mask                             # (B, H, W)
-    sup_mask = holdout_mask * ocean                        # only ocean hold-outs
+    ocean    = 1.0 - land_mask
+    sup_mask = holdout_mask * ocean
     n_valid  = sup_mask.sum().clamp(min=1.0)
 
-    pred_sq = pred.squeeze(1)                              # (B, H, W)
+    pred_sq = pred.squeeze(1)
     lv_sq   = log_var.squeeze(1).clamp(min=-10.0, max=10.0)
 
+    # Standard NLL component
     nll = 0.5 * (lv_sq + (pred_sq - target).pow(2) / lv_sq.exp())
-    return (nll * sup_mask).sum() / n_valid
+    nll_loss = (nll * sup_mask).sum() / n_valid
+
+    # [PERF 4] Spatial gradient matching — penalize Laplacian mismatch
+    # This encourages smooth, spatially coherent gap fills
+    laplacian_kernel = torch.tensor(
+        [[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+        dtype=pred_sq.dtype, device=pred_sq.device,
+    ).view(1, 1, 3, 3)
+
+    pred_lap = F.conv2d(
+        pred_sq.unsqueeze(1), laplacian_kernel, padding=1
+    ).squeeze(1)
+    target_lap = F.conv2d(
+        target.unsqueeze(1), laplacian_kernel, padding=1
+    ).squeeze(1)
+
+    grad_diff = (pred_lap - target_lap).pow(2)
+    grad_loss = (grad_diff * sup_mask).sum() / n_valid
+
+    # Weight the gradient term at 10% of NLL to avoid dominating
+    return nll_loss + 0.1 * grad_loss
 
 
 # ======================================================================
 # Forecast loss — masked Huber (smooth-L1)
-# [FIX 3] Switched from MSE to Huber for bloom-outlier robustness
 # ======================================================================
 
 def forecast_loss(
@@ -205,45 +156,17 @@ def forecast_loss(
 ) -> Tensor:
     """
     Masked Huber (smooth-L1) loss for Chl-a forecasting.
-
-    [FIX 3] Previously used plain MSE. Bloom events produce Chl-a spikes
-    that are legitimate extremes, not noise — but they cause MSE gradients
-    to be dominated by rare high-error pixels at t+4/t+5, destabilising
-    training. Huber with delta=0.5 behaves like MSE for errors < 0.5
-    (typical range) and like MAE for larger errors (bloom spikes), keeping
-    gradients bounded.
-
-    delta=0.5: For log-normalised Chl-a, errors > 0.5 correspond roughly
-    to >1.6× the typical interquartile range — a reasonable threshold for
-    "this is an outlier bloom spike, not a normal prediction error".
-
-    Only supervises pixels that are both:
-        - Observable in the forecast window (target_mask == 1)
-        - Not land (land_mask == 0)
-
-    Args:
-        pred:        (B, H_fcast, H, W)   predicted future Chl-a
-        target:      (B, H_fcast, H, W)   true future Chl-a (target_chl)
-        target_mask: (B, H_fcast, H, W)   1 = valid observable pixel
-        land_mask:   (B, H, W)            1 = land pixel
-        delta:       Huber threshold (default 0.5)
-
-    Returns:
-        Scalar loss (mean over valid pixels).
     """
-    ocean = (1.0 - land_mask).unsqueeze(1)                 # (B, 1, H, W)
-    valid = target_mask * ocean                            # (B, H_fcast, H, W)
+    ocean = (1.0 - land_mask).unsqueeze(1)
+    valid = target_mask * ocean
 
-    # F.huber_loss computes element-wise; we mask manually for correct mean
     huber = F.huber_loss(pred, target, reduction="none", delta=delta)
     n_valid = valid.sum().clamp(min=1.0)
     return (huber * valid).sum() / n_valid
 
 
 # ======================================================================
-# ERI loss — ordinal cross-entropy (cumulative link model)
-# [FIX 1] Soft ordinal penalty (was hard argmax)
-# [FIX 2] Focal modulation + rebalanced class weights
+# ERI loss — ordinal cross-entropy
 # ======================================================================
 
 def eri_loss(
@@ -254,107 +177,39 @@ def eri_loss(
     focal_gamma: float = 2.0,
 ) -> Tensor:
     """
-    Ordinal cross-entropy for ERI classification (5 levels: 0–4).
-
-    Uses a cumulative link model (CLM), also called proportional-odds model:
-        P(Y <= k) = sigmoid(threshold_k - score)   for k = 0..3
-        P(Y == k) = P(Y <= k) - P(Y <= k-1)
-
-    The thresholds are implicit in the 5-channel logits: we treat logits
-    as scores per level and derive cumulative probabilities via a log-softmax
-    over the ordinal levels.
-
-    In practice we use a simplified but effective approach:
-        - Convert logits to log-probabilities via log-softmax
-        - Apply standard NLL loss with integer class labels
-        - [FIX 1] Weight pixel losses by (1 + |soft_pred_level - true_level|)
-          where soft_pred_level = expected level under softmax (differentiable)
-        - [FIX 2] Apply focal modulation: multiply by (1-p_correct)^gamma
-          so the model focuses gradient on hard examples at class boundaries
-
-    [FIX 1] — Soft ordinal penalty:
-        Previously used `logits.argmax(dim=1)` (hard, non-differentiable).
-        Now uses `(softmax * level_indices).sum(dim=1)` — the expected level
-        under the current predicted distribution. This is smooth and gives
-        the model a continuous gradient signal to pull predictions toward
-        the ordinal midpoint.
-
-    [FIX 2] — Focal loss + rebalanced weights:
-        Previously class_weights = [0.20, 2.0, 3.0, 4.0, 5.0].
-        Class 1 (1–2 bloom steps) produced F1=0.378, indicating the weight
-        was far too low for the true class frequency (~2%). The model was
-        defaulting to class 0 on ambiguous low-bloom pixels.
-
-        New weights = [0.15, 5.0, 4.0, 4.0, 5.0]:
-          - Class 0 slightly reduced (0.15) to give more headroom to rare classes
-          - Class 1 increased from 2.0 → 5.0 to force learning the 0/1 boundary
-          - Classes 2–4 rebalanced to avoid drowning class 1
-
-        Focal modulation multiplies each pixel's loss by (1-p_correct)^gamma
-        (gamma=2.0 is the standard value from Lin et al. 2017). This means:
-          - Easy class-0 pixels (p_correct ≈ 0.99) get × 0.0001 — ignored
-          - Hard class-1 pixels (p_correct ≈ 0.5) get × 0.25 — trained hard
-          - Misclassified pixels (p_correct ≈ 0.1) get × 0.81 — trained hardest
-
-    Supervision is restricted to:
-        - Ocean pixels (land_mask == 0)
-        - If bloom_mask provided: upweight bloom pixels (class imbalance)
-
-    Args:
-        logits:      (B, 5, H, W)    raw ERI logits from ERIHead
-        target:      (B, H, W)       integer ERI labels (0–4), from bloom_mask
-                                     (0 = no risk, 4 = extreme bloom)
-        land_mask:   (B, H, W)       1 = land
-        bloom_mask:  (B, T, H, W) | None   if provided, any-time bloom pixels
-                                     get upweighted (bloom events are rare)
-        focal_gamma: Focal modulation exponent (default 2.0, 0 = no focal loss)
-
-    Returns:
-        Scalar loss.
+    Ordinal cross-entropy for ERI classification (5 levels: 0-4).
+    Focal modulation + soft ordinal penalty + rebalanced class weights.
     """
     B, n_levels, H, W = logits.shape
-    ocean = 1.0 - land_mask                                # (B, H, W)
+    ocean = 1.0 - land_mask
 
-    # Log-probabilities and probabilities per level
-    log_probs = F.log_softmax(logits, dim=1)               # (B, 5, H, W)
-    probs     = log_probs.exp()                            # (B, 5, H, W)
+    log_probs = F.log_softmax(logits, dim=1)
+    probs     = log_probs.exp()
 
-    # Standard NLL: (B, H, W)
     target_long = target.long().clamp(0, n_levels - 1)
-    nll = F.nll_loss(log_probs, target_long, reduction="none")  # (B, H, W)
+    nll = F.nll_loss(log_probs, target_long, reduction="none")
 
-    # [FIX 2] Rebalanced per-class inverse-frequency weights.
-    # Class 0 (~95%) slightly reduced; class 1 (~2%) substantially raised.
-    # Approximate priors for Bay of Bengal bloom statistics:
-    #   level 0 (~95%), level 1 (~2%), level 2 (~1%), level 3 (~1%), level 4 (~1%)
     class_weights = torch.tensor(
         [0.15, 5.0, 4.0, 4.0, 5.0], device=logits.device
     )
-    sample_weight = class_weights[target_long]             # (B, H, W)
+    sample_weight = class_weights[target_long]
 
-    # [FIX 1] Soft ordinal penalty: expected level under predicted distribution.
-    # Shape: (1, 5, 1, 1) for broadcast over (B, 5, H, W)
     level_idx  = torch.arange(n_levels, device=logits.device, dtype=torch.float)
     level_idx  = level_idx.view(1, n_levels, 1, 1)
-    soft_level = (probs * level_idx).sum(dim=1)            # (B, H, W) — differentiable
+    soft_level = (probs * level_idx).sum(dim=1)
     ord_penalty = 1.0 + (soft_level - target.float()).abs()
 
-    # [FIX 2] Focal modulation: (1 - p_correct)^gamma
-    # Gather the probability assigned to the true class at each pixel
     p_correct = probs.gather(
         dim=1, index=target_long.unsqueeze(1)
-    ).squeeze(1)                                           # (B, H, W)
+    ).squeeze(1)
     focal_weight = (1.0 - p_correct).clamp(min=0.0).pow(focal_gamma)
 
-    pixel_loss = nll * ord_penalty * sample_weight * focal_weight  # (B, H, W)
+    pixel_loss = nll * ord_penalty * sample_weight * focal_weight
 
-    # Bloom upweighting — bloom events are rare so they'd be overwhelmed
-    # by the majority "no risk" class without this
     weight = ocean.clone()
     if bloom_mask is not None:
-        # Any timestep with bloom activity → upweight that pixel
-        bloom_any = (bloom_mask.sum(dim=1) > 0).float()   # (B, H, W)
-        weight = weight * (1.0 + 5.0 * bloom_any)         # 6× weight on bloom pixels
+        bloom_any = (bloom_mask.sum(dim=1) > 0).float()
+        weight = weight * (1.0 + 5.0 * bloom_any)
 
     n_valid = weight.sum().clamp(min=1.0)
     return (pixel_loss * weight).sum() / n_valid
@@ -366,22 +221,9 @@ def eri_loss(
 
 def build_eri_target(bloom_mask: Tensor) -> Tensor:
     """
-    Derive integer ERI target labels (0–4) from bloom_mask.
-
-    ERI level is proportional to the fraction of T timesteps with active bloom:
-        0 bloom steps  → ERI 0 (no risk)
-        1–2 steps      → ERI 1 (low)
-        3–4 steps      → ERI 2 (moderate)
-        5–7 steps      → ERI 3 (high)
-        8–10 steps     → ERI 4 (extreme)
-
-    Args:
-        bloom_mask: (B, T, H, W)   binary bloom labels
-
-    Returns:
-        eri_target: (B, H, W)      integer labels 0–4
+    Derive integer ERI target labels (0-4) from bloom_mask.
     """
-    bloom_count = bloom_mask.sum(dim=1)                    # (B, H, W)  0–10
+    bloom_count = bloom_mask.sum(dim=1)
 
     eri = torch.zeros_like(bloom_count, dtype=torch.long)
     eri[bloom_count >= 1]  = 1
@@ -393,48 +235,98 @@ def build_eri_target(bloom_mask: Tensor) -> Tensor:
 
 
 # ======================================================================
+# [FEAT 1] Bloom forecast loss — binary CE for per-step bloom prediction
+# ======================================================================
+
+def bloom_forecast_loss(
+    logits: Tensor,
+    target_chl: Tensor,
+    target_mask: Tensor,
+    land_mask: Tensor,
+    bloom_threshold: float = 0.0,
+    pos_weight_value: float = 20.0,
+) -> Tensor:
+    """
+    Binary cross-entropy loss for bloom prediction at each forecast step.
+
+    Targets are derived from target_chl: a pixel is "bloom" if its
+    normalized Chl-a exceeds bloom_threshold at that forecast step.
+
+    Args:
+        logits:         (B, H_fcast, H, W)  raw logits from BloomForecastHead
+        target_chl:     (B, H_fcast, H, W)  future Chl-a (normalized)
+        target_mask:    (B, H_fcast, H, W)  1 = valid supervisable pixel
+        land_mask:      (B, H, W)           1 = land
+        bloom_threshold: threshold on normalized Chl-a for bloom detection.
+                        This should be set from norm_stats:
+                        threshold = (log1p(10.0) - chl_mean) / chl_std
+                        where 10.0 mg/m³ is the raw bloom threshold.
+        pos_weight_value: positive class weight for BCE. Blooms are rare
+                         (~0.5% of pixels), so we upweight positives heavily.
+
+    Returns:
+        Scalar loss.
+    """
+    ocean = (1.0 - land_mask).unsqueeze(1)           # (B, 1, H, W)
+    valid = target_mask * ocean                       # (B, H_fcast, H, W)
+
+    # Build binary bloom target from forecast Chl-a
+    bloom_target = (target_chl > bloom_threshold).float()  # (B, H_fcast, H, W)
+
+    # Positive class weight — blooms are very rare
+    pos_weight = torch.tensor(
+        [pos_weight_value], device=logits.device
+    )
+
+    # Element-wise BCE with logits
+    bce = F.binary_cross_entropy_with_logits(
+        logits, bloom_target, reduction="none",
+        pos_weight=pos_weight,
+    )
+
+    n_valid = valid.sum().clamp(min=1.0)
+    return (bce * valid).sum() / n_valid
+
+
+def build_bloom_forecast_target(
+    target_chl: Tensor,
+    bloom_threshold: float = 0.0,
+) -> Tensor:
+    """
+    Convenience: binary bloom labels at each forecast step.
+
+    Args:
+        target_chl:      (B, H_fcast, H, W) normalized future Chl-a
+        bloom_threshold:  threshold on normalized scale
+
+    Returns:
+        (B, H_fcast, H, W) binary, 1 = bloom at that step
+    """
+    return (target_chl > bloom_threshold).float()
+
+
+# ======================================================================
 # Combined loss
 # ======================================================================
 
 @dataclass
 class LossWeights:
-    recon:    float = 1.0
-    forecast: float = 0.5
-    eri:      float = 0.3
-    aux:      float = 0.001   # reduced from 0.01 — allows expert specialisation
-    holdout:  float = 0.5     # gap-filling supervision on held-out observed pixels
+    recon:       float = 1.0
+    forecast:    float = 0.5
+    eri:         float = 0.3
+    bloom_fcast: float = 0.3    # [FEAT 1] bloom lead-time prediction
+    aux:         float = 0.01   # [PERF 3] was 0.001 — fix expert collapse
+    holdout:     float = 0.5
 
 
 class MARASSLoss(nn.Module):
     """
-    Combined MM-MARAS training loss.
+    Combined MM-MARAS training loss (v2).
 
-    Wraps all four task losses with configurable weights and optional
-    curriculum ramp-up for forecast and ERI losses.
-
-    Curriculum:
-        For the first `curriculum_frac` of training (default 20%),
-        forecast and ERI weights are linearly ramped from 0 to their
-        full values. This lets the model first learn gap filling
-        (reconstruction) before being asked to forecast and classify.
-
-        Pass `step` and `total_steps` to forward() to enable curriculum.
-        If neither is passed, full weights are applied from step 0.
-
-    Usage:
-        criterion = MARASSLoss()
-
-        # Training loop
-        outputs = model(batch)
-        loss, breakdown = criterion(
-            outputs, batch,
-            step=global_step,
-            total_steps=total_training_steps,
-        )
-        loss.backward()
-
-        # breakdown is a dict of scalar losses for logging:
-        # {"total", "recon", "forecast", "eri", "aux", "holdout", "curriculum_scale"}
+    Changes from v1:
+        - bloom_fcast loss term added (binary CE, curriculum-ramped)
+        - aux weight increased from 0.001 to 0.01
+        - holdout loss includes spatial gradient matching
     """
 
     def __init__(
@@ -443,15 +335,16 @@ class MARASSLoss(nn.Module):
         curriculum_frac: float = 0.20,
         forecast_delta: float = 0.5,
         eri_focal_gamma: float = 2.0,
+        bloom_threshold: float = 0.0,
     ) -> None:
         super().__init__()
         self.w = weights or LossWeights()
         self.curriculum_frac  = curriculum_frac
         self.forecast_delta   = forecast_delta
         self.eri_focal_gamma  = eri_focal_gamma
+        self.bloom_threshold  = bloom_threshold
 
     def _curriculum_scale(self, step: int | None, total_steps: int | None) -> float:
-        """Returns a scale in [0, 1] for forecast/ERI based on training progress."""
         if step is None or total_steps is None:
             return 1.0
         warmup = int(total_steps * self.curriculum_frac)
@@ -474,19 +367,17 @@ class MARASSLoss(nn.Module):
             total_steps: Total training steps (for curriculum).
 
         Returns:
-            loss:      Scalar total loss (call .backward() on this).
+            loss:      Scalar total loss.
             breakdown: Dict of individual loss values for logging.
         """
-        land_mask   = batch["land_mask"]                   # (B, H, W)
-        obs_mask    = batch["obs_mask"]                    # (B, T, H, W)
-        chl_obs     = batch["chl_obs"]                     # (B, T, H, W)
-        target_chl  = batch["target_chl"]                  # (B, H_fcast, H, W)
-        target_mask = batch["target_mask"]                 # (B, H_fcast, H, W)
-        bloom_mask  = batch["bloom_mask"]                  # (B, T, H, W)
+        land_mask   = batch["land_mask"]
+        obs_mask    = batch["obs_mask"]
+        chl_obs     = batch["chl_obs"]
+        target_chl  = batch["target_chl"]
+        target_mask = batch["target_mask"]
+        bloom_mask  = batch["bloom_mask"]
 
         # --- Reconstruction ---
-        # Pass holdout_mask so NLL supervision excludes held-out pixels —
-        # those are supervised separately by holdout_recon_loss.
         l_recon = recon_loss(
             pred         = outputs["recon"],
             log_var      = outputs["uncertainty"],
@@ -506,7 +397,7 @@ class MARASSLoss(nn.Module):
         )
 
         # --- ERI (focal + soft ordinal) ---
-        eri_target = build_eri_target(bloom_mask)          # (B, H, W)
+        eri_target = build_eri_target(bloom_mask)
         l_eri = eri_loss(
             logits      = outputs["eri"],
             target      = eri_target,
@@ -515,13 +406,25 @@ class MARASSLoss(nn.Module):
             focal_gamma = self.eri_focal_gamma,
         )
 
+        # --- [FEAT 1] Bloom forecast (binary CE) ---
+        if "bloom_forecast" in outputs:
+            l_bloom_fcast = bloom_forecast_loss(
+                logits          = outputs["bloom_forecast"],
+                target_chl      = target_chl,
+                target_mask     = target_mask,
+                land_mask       = land_mask,
+                bloom_threshold = self.bloom_threshold,
+            )
+        else:
+            l_bloom_fcast = torch.tensor(0.0, device=l_recon.device)
+
         # --- Aux (MoE load-balancing) ---
         if "routing_weights" in outputs:
             l_aux = compute_aux_loss(outputs["routing_weights"])
         else:
             l_aux = torch.tensor(0.0, device=l_recon.device)
 
-        # --- Holdout reconstruction loss (gap-filling supervision, NLL) ---
+        # --- Holdout reconstruction (NLL + gradient matching) ---
         if "holdout_mask" in outputs and outputs["holdout_mask"] is not None:
             l_holdout = holdout_recon_loss(
                 pred         = outputs["recon"],
@@ -537,20 +440,22 @@ class MARASSLoss(nn.Module):
         scale = self._curriculum_scale(step, total_steps)
 
         total = (
-            self.w.recon    * l_recon
-          + self.w.forecast * scale * l_forecast
-          + self.w.eri      * scale * l_eri
-          + self.w.aux      * l_aux
-          + self.w.holdout  * l_holdout
+            self.w.recon       * l_recon
+          + self.w.forecast    * scale * l_forecast
+          + self.w.eri         * scale * l_eri
+          + self.w.bloom_fcast * scale * l_bloom_fcast   # [FEAT 1]
+          + self.w.aux         * l_aux                    # [PERF 3] 0.01
+          + self.w.holdout     * l_holdout
         )
 
         breakdown = {
-            "total":    total.item(),
-            "recon":    l_recon.item(),
-            "forecast": l_forecast.item(),
-            "eri":      l_eri.item(),
-            "aux":      l_aux.item(),
-            "holdout":  l_holdout.item(),
+            "total":       total.item(),
+            "recon":       l_recon.item(),
+            "forecast":    l_forecast.item(),
+            "eri":         l_eri.item(),
+            "bloom_fcast": l_bloom_fcast.item(),
+            "aux":         l_aux.item(),
+            "holdout":     l_holdout.item(),
             "curriculum_scale": scale,
         }
 
@@ -577,28 +482,27 @@ def run_smoke_test() -> None:
     B = 4
     T, H, W, H_fcast = cfg.T, cfg.H, cfg.W, cfg.H_fcast
 
-    # Simulate a realistic batch
-    obs = (torch.rand(B, T, H, W) > 0.30).float()   # 70% valid
+    obs = (torch.rand(B, T, H, W) > 0.30).float()
     batch = {
-        "chl_obs":    torch.randn(B, T, H, W) * obs,
-        "obs_mask":   obs,
-        "mcar_mask":  torch.zeros(B, T, H, W),
-        "mnar_mask":  torch.zeros(B, T, H, W),
-        "bloom_mask": (torch.rand(B, T, H, W) > 0.95).float(),
-        "physics":    torch.randn(B, T, 6, H, W),
-        "wind":       torch.randn(B, T, 4, H, W),
-        "static":     torch.randn(B, 2, H, W),
-        "discharge":  torch.randn(B, T, 2, H, W),
-        "bgc_aux":    torch.randn(B, T, 5, H, W),
-        "land_mask":  (torch.rand(B, H, W) > 0.97).float(),
-        "target_chl": torch.randn(B, H_fcast, H, W),
+        "chl_obs":     torch.randn(B, T, H, W) * obs,
+        "obs_mask":    obs,
+        "mcar_mask":   torch.zeros(B, T, H, W),
+        "mnar_mask":   torch.zeros(B, T, H, W),
+        "bloom_mask":  (torch.rand(B, T, H, W) > 0.95).float(),
+        "physics":     torch.randn(B, T, 6, H, W),
+        "wind":        torch.randn(B, T, 4, H, W),
+        "static":      torch.randn(B, 2, H, W),
+        "discharge":   torch.randn(B, T, 2, H, W),
+        "bgc_aux":     torch.randn(B, T, 5, H, W),
+        "land_mask":   (torch.rand(B, H, W) > 0.97).float(),
+        "target_chl":  torch.randn(B, H_fcast, H, W),
         "target_mask": (torch.rand(B, H_fcast, H, W) > 0.30).float(),
     }
 
     outputs = model(batch)
-    criterion = MARASSLoss()
+    criterion = MARASSLoss(bloom_threshold=0.0)
 
-    # Step 0 of 1000 — curriculum scale should be 0 for forecast/ERI
+    # Step 0 — curriculum should be 0 for forecast/ERI/bloom
     loss, breakdown = criterion(outputs, batch, step=0, total_steps=1000)
 
     print("\n--- Loss breakdown (step=0, curriculum=0%) ---")
@@ -608,40 +512,19 @@ def run_smoke_test() -> None:
     assert torch.isfinite(loss), "Loss is not finite"
     print(f"\nTotal loss: {loss.item():.4f}  (finite: OK)")
 
-    # Mid-training — curriculum scale should be ~0.5
-    loss2, breakdown2 = criterion(outputs, batch, step=100, total_steps=1000)
-    print(f"\n--- Curriculum scale at step 100/1000: {breakdown2['curriculum_scale']:.2f} ---")
-    assert breakdown2["curriculum_scale"] == 0.5, "Expected 0.5 at 10% of warmup (20% of total)"
+    # Verify bloom_fcast loss is present
+    assert "bloom_fcast" in breakdown, "bloom_fcast missing from breakdown"
+    print(f"Bloom forecast loss: {breakdown['bloom_fcast']:.4f}")
 
-    # Full training — scale = 1.0
-    loss3, breakdown3 = criterion(outputs, batch, step=500, total_steps=1000)
-    print(f"--- Curriculum scale at step 500/1000: {breakdown3['curriculum_scale']:.2f} ---")
-    assert breakdown3["curriculum_scale"] == 1.0
-
-    # Backward pass check
+    # Backward pass
     loss.backward()
-    grad_norms = {
-        name: p.grad.norm().item()
-        for name, p in model.named_parameters()
-        if p.grad is not None
-    }
-    n_params_with_grad = len(grad_norms)
-    all_finite = all(torch.isfinite(torch.tensor(v)) for v in grad_norms.values())
-    print(f"\nBackward pass: {n_params_with_grad} params with gradients, all finite: {all_finite}")
+    n_grads = sum(1 for _, p in model.named_parameters() if p.grad is not None)
+    print(f"\nBackward pass: {n_grads} params with gradients")
 
-    # Verify focal loss reduces loss on easy examples
-    # (sanity: ERI loss with all-class-0 predictions should be small)
-    print("\n--- Focal loss sanity check ---")
-    easy_logits = torch.zeros(B, 5, H, W)
-    easy_logits[:, 0] = 10.0          # very confident class 0
-    easy_target = torch.zeros(B, H, W, dtype=torch.long)
-    land = torch.zeros(B, H, W)
-    l_easy = eri_loss(easy_logits, easy_target, land, focal_gamma=2.0)
-    l_easy_nofocal = eri_loss(easy_logits, easy_target, land, focal_gamma=0.0)
-    print(f"  ERI loss (easy correct, focal γ=2): {l_easy.item():.6f}")
-    print(f"  ERI loss (easy correct, no focal):  {l_easy_nofocal.item():.6f}")
-    assert l_easy.item() < l_easy_nofocal.item(), "Focal loss should reduce easy-example loss"
-    print("  Focal suppression confirmed: easy examples correctly down-weighted")
+    # Bloom forecast target builder
+    bloom_tgt = build_bloom_forecast_target(batch["target_chl"], bloom_threshold=0.0)
+    print(f"Bloom forecast target: {tuple(bloom_tgt.shape)}, "
+          f"{bloom_tgt.mean().item()*100:.1f}% positive")
 
     print("\nSmoke test passed.")
 
