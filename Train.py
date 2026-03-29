@@ -620,7 +620,7 @@ def main() -> None:
             aux=args.w_aux,
             holdout=args.w_holdout,
         ),
-        bloom_threshold=10.85,
+        bloom_threshold=2.5,
     ).to(device)
 
     # ------------------------------------------------------------------
