@@ -740,10 +740,11 @@ def forward_with_routing(model, batch):
     decoded, routing_w = m.decoder(state, return_routing=True)
 
     return {
-        "recon":       m.recon_head(decoded),
-        "forecast":    m.forecast_head(decoded),
-        "uncertainty": m.uncertainty_head(decoded),
-        "eri":         m.eri_head(decoded),
+        "recon":          m.recon_head(decoded),
+        "forecast":       m.forecast_head(decoded),
+        "uncertainty":    m.uncertainty_head(decoded),
+        "eri":            m.eri_head(decoded),
+        "bloom_forecast": m.bloom_fcast_head(decoded),
     }, routing_w
 
 
