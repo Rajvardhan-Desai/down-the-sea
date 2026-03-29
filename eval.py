@@ -562,7 +562,7 @@ class BloomForecastAccumulator:
     Bloom targets are derived from target_chl at a normalized threshold.
     """
 
-    def __init__(self, h_fcast: int, bloom_threshold: float = 10.85):
+    def __init__(self, h_fcast: int, bloom_threshold: float = 2.5):
         self.h_fcast = h_fcast
         self.bloom_threshold = bloom_threshold
         self.tp = [0] * h_fcast
@@ -660,7 +660,7 @@ def save_bloom_forecast_figure(
     impact:       np.ndarray,   # (H, W)
     path: Path,
     idx:  int,
-    bloom_threshold: float = 10.85,
+    bloom_threshold: float = 2.5,
 ) -> None:
     """Save bloom probability maps + ecosystem impact for one sample."""
     plt = _plt()
@@ -797,7 +797,7 @@ def evaluate(args: argparse.Namespace) -> None:
     eri_acc     = ERIAccumulator(cfg.n_eri_levels)
     uncert_acc  = UncertaintyAccumulator()
     routing_acc = RoutingAccumulator(cfg.n_experts)
-    bloom_acc   = BloomForecastAccumulator(cfg.H_fcast, bloom_threshold=10.85)
+    bloom_acc   = BloomForecastAccumulator(cfg.H_fcast, bloom_threshold=2.5)
     impact_acc  = EcosystemImpactAccumulator()
 
     n_figs = 0
